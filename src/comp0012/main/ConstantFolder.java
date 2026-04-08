@@ -3,6 +3,8 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 import org.apache.bcel.classfile.*;
 import org.apache.bcel.generic.*;
@@ -46,12 +48,24 @@ public class ConstantFolder
 				continue;
 			}
 
-			boolean changed = foldConstants(il, cpgen);
+			boolean methodChanged = false;
+			boolean loopChanged = true;
 
-			if (changed) {
+			while (loopChanged) {
+				boolean foldedVars = foldConstantVariables(il, cpgen);
+				boolean foldedMath = foldConstants(il, cpgen);
+				loopChanged = foldedVars || foldedMath;
+				if (loopChanged) {
+					methodChanged = true;
+				}
+			}
+
+			if (methodChanged) {
 				il.setPositions(true);
 				mg.setMaxStack();
 				mg.setMaxLocals();
+				mg.removeCodeAttributes();
+				cgen.setMajor(50);
 				cgen.replaceMethod(method, mg.getMethod());
 			}
 		}
@@ -98,6 +112,73 @@ public class ConstantFolder
 
 		return changed;
 	}
+
+	// Stage 2: Constant variables
+	private boolean foldConstantVariables(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = false;
+		Map<Integer, Integer> storeCounts = new HashMap<>();
+		
+		// Count assignments for each variable
+		for (InstructionHandle ih = il.getStart(); ih != null; ih = ih.getNext()) {
+			Instruction inst = ih.getInstruction();
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+				storeCounts.put(index, storeCounts.getOrDefault(index, 0) + 1);
+			}
+			// Bug fix, need to count IINC as well since it modifies variables
+			else if (inst instanceof IINC) {
+				int index = ((IINC) inst).getIndex();
+				storeCounts.put(index, storeCounts.getOrDefault(index, 0) + 1);
+			}
+		}
+		// Find variables assigned only once to a constant.
+		Map<Integer, Number> constantValues = new HashMap<>();
+		for (InstructionHandle ih = il.getStart(); ih != null; ih = ih.getNext()) {
+			Instruction inst = ih.getInstruction();
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+
+				if (storeCounts.get(index) == 1) {
+					InstructionHandle prev = ih.getPrev();
+					if (prev != null ) {
+						Number val = getNumericValue(prev, cpgen);
+						if (val != null) {
+							constantValues.put(index, val);
+						}
+					}
+				}
+			}
+		}
+		// Replace loads of constant variables with actual values.
+		InstructionHandle ih = il.getStart();
+		while (ih != null) {
+			Instruction inst = ih.getInstruction();
+			InstructionHandle nextIh = ih.getNext();
+
+			if (inst instanceof LoadInstruction) {
+				int index = ((LoadInstruction) inst).getIndex();
+				if (constantValues.containsKey(index)) {
+					Number val = constantValues.get(index);
+					InstructionHandle newIh = handleResult(val, il, ih, cpgen);
+
+					try {
+						il.delete(ih);
+					} catch (TargetLostException e) {
+						for (InstructionHandle target : e.getTargets()) {
+							for (InstructionTargeter targeter : target.getTargeters()) {
+								targeter.updateTarget(target, newIh);
+							}
+						}
+					}
+					changed = true;
+				}
+			}
+			ih = nextIh;
+		}
+
+		return changed;
+	}
+
 	
 	private InstructionHandle handleResult(Number result, InstructionList il, InstructionHandle h1, ConstantPoolGen cpgen) {
 		InstructionHandle newHandle = null;	
