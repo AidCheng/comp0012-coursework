@@ -6,6 +6,8 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.bcel.classfile.*;
 import org.apache.bcel.generic.*;
 
@@ -54,7 +56,8 @@ public class ConstantFolder
 			while (loopChanged) {
 				boolean foldedVars = foldConstantVariables(il, cpgen);
 				boolean foldedMath = foldConstants(il, cpgen);
-				loopChanged = foldedVars || foldedMath;
+				boolean foldedDynamic = foldDynamicVariables(il, cpgen);
+				loopChanged = foldedVars || foldedDynamic || foldedMath;
 				if (loopChanged) {
 					methodChanged = true;
 				}
@@ -179,6 +182,94 @@ public class ConstantFolder
 		return changed;
 	}
 
+	// Stage 3: Dynamic variables - propagate constant values between reassignments
+	private boolean foldDynamicVariables(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = false;
+
+		Map<Integer, List<InstructionHandle>> storesByVar = getConstantStoresByVar(il, cpgen);
+
+		for (Map.Entry<Integer, List<InstructionHandle>> entry : storesByVar.entrySet()) {
+			int varIndex = entry.getKey();
+			List<InstructionHandle> stores = entry.getValue();
+
+			InstructionHandle ih = il.getStart();
+			while (ih != null) {
+				InstructionHandle next = ih.getNext();
+				Instruction inst = ih.getInstruction();
+
+				if (inst instanceof LoadInstruction && ((LoadInstruction) inst).getIndex() == varIndex) {
+					InstructionHandle activeStore = getMostRecentStoreBefore(ih, stores, il);
+					if (activeStore != null) {
+						Number val = getNumericValue(activeStore.getPrev(), cpgen);
+						if (val != null) {
+							InstructionHandle newIh = handleResult(val, il, ih, cpgen);
+							try {
+								il.delete(ih);
+							} catch (TargetLostException e) {
+								for (InstructionHandle target : e.getTargets()) {
+									for (InstructionTargeter targeter : target.getTargeters()) {
+										targeter.updateTarget(target, newIh);
+									}
+								}
+							}
+							changed = true;
+						}
+					}
+				}
+				ih = next;
+			}
+		}
+
+		return changed;
+	}
+
+	// map of varindex store
+	private Map<Integer, List<InstructionHandle>> getConstantStoresByVar(InstructionList il, ConstantPoolGen cpgen) {
+		Map<Integer, Integer> totalStoreCounts = new HashMap<>();
+		for (InstructionHandle ih = il.getStart(); ih != null; ih = ih.getNext()) {
+			Instruction inst = ih.getInstruction();
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+				totalStoreCounts.put(index, totalStoreCounts.getOrDefault(index, 0) + 1);
+			} else if (inst instanceof IINC) {
+				int index = ((IINC) inst).getIndex();
+				totalStoreCounts.put(index, totalStoreCounts.getOrDefault(index, 0) + 1);
+			}
+		}
+
+		Map<Integer, List<InstructionHandle>> constantStores = new HashMap<>();
+		for (InstructionHandle ih = il.getStart(); ih != null; ih = ih.getNext()) {
+			Instruction inst = ih.getInstruction();
+			if (inst instanceof StoreInstruction) {
+				int index = ((StoreInstruction) inst).getIndex();
+				if (totalStoreCounts.getOrDefault(index, 0) <= 1) continue;
+				InstructionHandle prev = ih.getPrev();
+				if (prev != null && getNumericValue(prev, cpgen) != null) {
+					constantStores.computeIfAbsent(index, k -> new ArrayList<>()).add(ih);
+				}
+			}
+		}
+
+		Map<Integer, List<InstructionHandle>> result = new HashMap<>();
+		for (Map.Entry<Integer, List<InstructionHandle>> entry : constantStores.entrySet()) {
+			int index = entry.getKey();
+			if (entry.getValue().size() == totalStoreCounts.get(index)) {
+				result.put(index, entry.getValue());
+			}
+		}
+
+		return result;
+	}
+
+	private InstructionHandle getMostRecentStoreBefore(InstructionHandle load, List<InstructionHandle> stores, InstructionList il) {
+		InstructionHandle mostRecent = null;
+		for (InstructionHandle ih = il.getStart(); ih != null && ih != load; ih = ih.getNext()) {
+			if (stores.contains(ih)) {
+				mostRecent = ih;
+			}
+		}
+		return mostRecent;
+	}
 	
 	private InstructionHandle handleResult(Number result, InstructionList il, InstructionHandle h1, ConstantPoolGen cpgen) {
 		InstructionHandle newHandle = null;	
