@@ -57,7 +57,8 @@ public class ConstantFolder
 				boolean foldedVars = foldConstantVariables(il, cpgen);
 				boolean foldedMath = foldConstants(il, cpgen);
 				boolean foldedDynamic = foldDynamicVariables(il, cpgen);
-				loopChanged = foldedVars || foldedDynamic || foldedMath;
+				boolean eliminatedStores = eliminateDeadCode(il, cpgen);
+				loopChanged = foldedVars || foldedDynamic || foldedMath || eliminatedStores;
 				if (loopChanged) {
 					methodChanged = true;
 				}
@@ -98,16 +99,19 @@ public class ConstantFolder
 				result = foldDispatcher(v1, v2, h3);
 
 				if (result != null) {
+					InstructionHandle newHandle = handleResult(result, il, h1, cpgen);
 					try {
-						InstructionHandle newHandle = handleResult(result, il, h1, cpgen);
-
 						il.delete(h1, h3);
-						changed = true;
-						current = newHandle;
-						continue;
 					} catch (TargetLostException e) {
-						e.printStackTrace();
+						for (InstructionHandle target : e.getTargets()) {
+							for (InstructionTargeter targeter : target.getTargeters()) {
+								targeter.updateTarget(target, newHandle);
+							}
+						}
 					}
+					changed = true;
+					current = newHandle;
+					continue;
 				}
 			}
 			current = current.getNext();
@@ -271,6 +275,79 @@ public class ConstantFolder
 		return mostRecent;
 	}
 	
+	private boolean eliminateDeadCode(InstructionList il, ConstantPoolGen cpgen) {
+		boolean changed = false;
+
+		InstructionHandle ih = il.getStart();
+		while (ih != null) {
+			InstructionHandle next = ih.getNext();
+			Instruction inst = ih.getInstruction();
+
+			if (!(inst instanceof StoreInstruction)) {
+				ih = next;
+				continue;
+			}
+
+			int index = ((StoreInstruction) inst).getIndex();
+
+			boolean loadFound = false;
+			for (InstructionHandle scan = ih.getNext(); scan != null; scan = scan.getNext()) {
+				Instruction scanInst = scan.getInstruction();
+
+				// dead variable as stored to same variable before any load
+				if (scanInst instanceof StoreInstruction && ((StoreInstruction) scanInst).getIndex() == index) {
+					break;
+				}
+
+				// live variable as load found
+				if (scanInst instanceof LoadInstruction && ((LoadInstruction) scanInst).getIndex() == index) {
+					loadFound = true;
+					break;
+				}
+			}
+
+			if (!loadFound) {
+				InstructionHandle prev = ih.getPrev();
+				boolean storeIsTarget = ih.hasTargeters();
+				boolean prevIsConstant = prev != null && getNumericValue(prev, cpgen) != null;
+
+				// skip if the store itself is a branch target as nothing safe to redirect to
+				if (storeIsTarget) {
+					ih = next;
+					continue;
+				}
+
+				// remove both store and constant push if the store is preceded by a constant push
+				if (prevIsConstant) {
+					InstructionHandle afterStore = ih.getNext();
+					if (afterStore == null) {
+						ih = next;
+						continue;
+					}
+					if (prev.hasTargeters()) {
+						il.redirectBranches(prev, afterStore);
+					}
+					try {
+						il.delete(prev, ih);
+						changed = true;
+					} catch (TargetLostException e) {
+					}
+				} else {
+					// just delete the store instruction if preceding instruction is not a constant
+					try {
+						il.delete(ih);
+						changed = true;
+					} catch (TargetLostException e) {
+					}
+				}
+			}
+
+			ih = next;
+		}
+
+		return changed;
+	}
+
 	private InstructionHandle handleResult(Number result, InstructionList il, InstructionHandle h1, ConstantPoolGen cpgen) {
 		InstructionHandle newHandle = null;	
 		if (result instanceof Integer){
